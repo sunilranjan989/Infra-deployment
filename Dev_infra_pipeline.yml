@@ -1,0 +1,154 @@
+trigger:
+  branches:
+    include:
+      - main
+      - feature/*
+
+parameters:
+- name: environment
+  displayName: Select Environment
+  type: string
+  default: dev
+  values:
+    - dev
+    - prod
+
+variables:
+  workDir: '$(System.DefaultWorkingDirectory)/Environment/${{ parameters.environment }}'
+  tfstateKey: '${{ parameters.environment }}.terraform.tfstate'
+
+# ---------------- PRE-BUILD SCANNING ----------------
+stages:
+- stage: PreBuildScanning
+  displayName: Pre-Build Scanning
+  jobs:
+  - job: TFLintScan
+    displayName: TFLint Scan
+    pool: agent-vinod   # Windows self-hosted agent
+
+    steps:
+    - task: PowerShell@2
+      displayName: Run TFLint
+      continueOnError: true
+      inputs:
+        targetType: inline
+        script: |
+          $tflintPath = 'C:\tflint\tflint.exe'
+
+          if (!(Test-Path $tflintPath)) {
+            Write-Error "TFLint not found at $tflintPath"
+            exit 1
+          }
+
+          & $tflintPath --version
+          cd "$(workDir)"
+          & $tflintPath --init
+          & $tflintPath
+
+
+
+# ---------------- BUILD ----------------
+- stage: Build
+  displayName: Terraform Build
+  dependsOn: PreBuildScanning
+  jobs:
+  - job: InitAndPlan
+    displayName: Init & Plan
+    pool: agent-vinod
+
+    steps:
+    - task: TerraformTaskV4@4
+      displayName: Terraform Init
+      inputs:
+        provider: 'azurerm'
+        command: 'init'
+        workingDirectory: '$(workDir)'
+        backendServiceArm: 'NEWRG1'
+        backendAzureRmResourceGroupName: 'todorgbackend'
+        backendAzureRmStorageAccountName: 'addevpipelinebacken'
+        backendAzureRmContainerName: 'sunilcontainer'
+        backendAzureRmKey: '$(tfstateKey)'
+
+    - task: TerraformTaskV4@4
+      displayName: Terraform Plan
+      inputs:
+        provider: 'azurerm'
+        command: 'plan'
+        workingDirectory: '$(workDir)'
+        commandOptions: '-out=tfplan.binary'
+        environmentServiceNameAzureRM: 'NEWRG1'
+
+    - task: PublishPipelineArtifact@1
+      displayName: Publish Terraform Plan
+      inputs:
+        targetPath: '$(workDir)/tfplan.binary'
+        artifact: 'terraform-plan'
+
+# ---------------- SECURITY SCANNING ----------------
+- stage: SecurityScanning
+  displayName: Security Scanning
+  dependsOn: Build
+  jobs:
+  - job: TFsecScan
+    displayName: TFsec
+    pool: agent-vinod
+
+    steps:
+    - task: tfsec@1
+      displayName: Run TFsec
+      continueOnError: true
+      inputs:
+        version: 'v1.26.0'
+        dir: '$(workDir)'
+
+# ---------------- MANUAL VALIDATION ----------------
+- stage: ManualValidation
+  displayName: Manual Validation
+  dependsOn: SecurityScanning
+
+  jobs:
+  - job: Approval
+    displayName: Approval
+    pool: server
+
+    steps:
+    - task: ManualValidation@1
+      displayName: Approval Required
+      inputs:
+        notifyUsers: 'sunilranjan983@gmail.com'
+        approvers: 'sunilranjan983@gmail.com'
+
+# ---------------- DEPLOY ----------------
+- stage: Deploy
+  displayName: Terraform Apply
+  dependsOn:
+    - SecurityScanning
+    - ManualValidation
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+
+  jobs:
+  - job: Apply
+    displayName: Terraform Apply
+    pool: agent-vinod
+
+    steps:
+    - task: TerraformTaskV4@4
+      displayName: Terraform Init
+      inputs:
+        provider: 'azurerm'
+        command: 'init'
+        workingDirectory: '$(workDir)'
+        backendServiceArm: 'NEWRG1'
+        backendAzureRmResourceGroupName: 'todorgbackend'
+        backendAzureRmStorageAccountName: 'adodevpipelinebackend'
+        backendAzureRmContainerName: 'sunilcontainer'
+        backendAzureRmKey: '$(tfstateKey)'
+
+    - task: TerraformTaskV4@4
+      displayName: Terraform Apply
+      inputs:
+        provider: 'azurerm'
+        command: 'apply'
+        workingDirectory: '$(workDir)'
+        commandOptions: '-auto-approve'
+        environmentServiceNameAzureRM: 'NEWRG1'
